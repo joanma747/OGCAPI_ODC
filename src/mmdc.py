@@ -203,6 +203,27 @@ def getDriverFromMediaType(mimetype):
         return 'ENVI'
     return ""
 
+#It also tranforms nodata values into the whitest color    
+def scaleDataSetTo256Colors(ds_res):
+    #In the future consider using the histogram to remove some extreme values that may distort the rescale.
+    #import numpy as np
+    #stacked = dst_cl.stack(stacked=[...])  #flatening the array https://stackoverflow.com/questions/73395873/how-to-turn-a-3-d-xarray-dataset-into-a-1d-dataset
+    #stacked["Forest"]
+    #counts, bin_edges = np.histogram(stacked["Forest"], bins=256)  # performing the histogram https://stackoverflow.com/questions/58974986/python-3-histogram-how-to-get-counts-and-bins-with-plt-hist-but-without-disp
+
+    mi=ds_res.min().item()
+    mx=ds_res.max().item()
+        
+    ds_res = ds_res.where(~ds_res.isnull(), other=mx+(mx-mi)/256)  #nodata goes above the maximum (white color)
+    
+    if mx==mi:
+        a=1
+    else:
+        mx=mx+(mx-mi)*2/256  #If I do not do that, the whitest color becomes black
+        a=256.0/(mx-mi)
+
+    return ((ds_res-mi)*a).astype('uint8')  #range adapted to a maximum of 256     
+
 def getBandFromDataCube(dc, layers, bbox, bboxCrs, crs, res, time, band, mimetype):
     #print(layers)
     #print(str(bbox[0]) +" "+ str(bbox[1]))
@@ -246,26 +267,16 @@ def getBandFromDataCube(dc, layers, bbox, bboxCrs, crs, res, time, band, mimetyp
     if list(ds.data_vars)[0]=="slc":
         return ds.astype('uint8')[band]
 
+    ds_res=ds[band]
     p=dc.index.products.get_by_name(layers)
     if p:
         for m in p.definition["measurements"]:
             if band==m["name"]:
-                if m["nodata"]:
-                    ds=ds.where(ds[band]!=m["nodata"])
+                if "nodata" in m:
+                    ds_res=ds_res.where(ds_res!=m["nodata"])
                 break
-
-    mi=ds[band].min().item()
-    mx=ds[band].max().item()
-    ds = ds.where(~ds.isnull(), other=mx+(mx-mi)*0.01)  #forcing a white color for nodata
-    mx=mx+(mx-mi)*0.011
-
-    if mx==mi:
-        a=1
-    else:
-        a=256.0/(mx-mi)
-
-    return ((ds-mi)*a).astype('uint8')[band]  #range adapted to a maximum of 256 
-    #return (ds/64).astype('uint8')[band]  #range adapted to a maximum of 256 
+    
+    return scaleDataSetTo256Colors(ds_res)
 
 evaluateSliceInDataCubeVariables={}  #The only way  have found to communicate to the Sclice function. returnResultExpressionFromDataCube() populates it and evaluateSliceInDataCube uses it
 
@@ -341,13 +352,17 @@ def returnResultExpressionFromDataCube(dc, layers, bbox, bboxCrs, crs, res, time
                  resolution=(-res["x"],res["y"])
         )
                 
-    p=dc.index.products.get_by_name(layers)
+    
+    ds=ds.isel(time=0, drop=True)  #reduce the number of dimensions to 2.
+
     bandDict={}
     
-    ds=ds.isel(time=0, drop=True)
-    
+    p=dc.index.products.get_by_name(layers)
     for m in p.definition["measurements"]:
-        bandDict[m["name"]]=ds[m["name"]].astype('float')
+        if "nodata" in m:
+            bandDict[m["name"]]=ds[m["name"]].where(ds[m["name"]]!=m["nodata"]).astype('float')
+        else:
+            bandDict[m["name"]]=ds[m["name"]].astype('float')
     
     # for security reasons: https://realpython.com/python-eval-function/
     bandDict["__builtins__"]: {}
@@ -369,16 +384,10 @@ def returnResultExpressionFromDataCube(dc, layers, bbox, bboxCrs, crs, res, time
     #    print(ds_res)
     #    sys.exit(0)
     
-    bandDict["ds_res"]=ds_res
 
     if filterWhere!="":
-        mi=ds_res[0].min().item()
-        ds_resFilter=eval("ds_res.where("+filterWhere+")", bandDict, {})
-        if mi==-9999: #exception to remove ·$·
-            ds_res = ds_res.where(~ds_resFilter.isnull(), other=0)
-        else:
-            mx=ds_res[0].max().item()
-            ds_res = ds_res.where(~ds_resFilter.isnull(), other=mx+(mx-mi)*0.01)
+        bandDict["ds_res"]=ds_res
+        ds_res=eval("ds_res.where("+filterWhere+")", bandDict, {})
             
     return ds_res
 
@@ -416,16 +425,8 @@ def getExpressionFromDataCube(dc, layers, bbox, bboxCrs, crs, res, time, express
     if driver=='GTiff' or driver=='ENVI':
         return ds_res
 
-    mi=ds_res.min().item()
-    mx=ds_res.max().item()
-    
-    if mx==mi:
-        a=1
-    else:
-        mx=mx+(mx-mi)*0.001  #If I do not do that, the whitest color becomes black
-        a=256.0/(mx-mi)
-
-    return ((ds_res-mi)*a).astype('uint8')  #range adapted to a maximum of 256 
+    return scaleDataSetTo256Colors(ds_res)
+     
 
 def sendImageResult(ds_band, crs, mimetype):
     driver=getDriverFromMediaType(mimetype)
@@ -807,6 +808,8 @@ def ogcpi(path_param, query_params):
         #http://localhost/cgi-bin/mmdc.py/collections/TerrestrialConnectivityIndex/coverage?subset=E(390401.47:437401.47),N(4582942.45:4612942.45),time("2017-01-01")&subset-crs=[EPSG:32631]&crs=[EPSG:32631]&properties=Forest&filter=Forest<>-9999
         #http://localhost/cgi-bin/mmdc.py/collections/TerrestrialConnectivityIndex/coverage?subset=E(390401.47:437401.47),N(4582942.45:4612942.45),time("2017-01-01")&subset-crs=[EPSG:32631]&crs=[EPSG:32631]&properties=Forest
         #http://localhost/cgi-bin/mmdc.py/collections/TerrestrialConnectivityIndex/coverage?subset=E(390401.47:437401.47),N(4582942.45:4612942.45),time("2017-01-01")&subset-crs=[EPSG:32631]&crs=[EPSG:32631]&properties=Forest-Slice(Forest,['time'],['2012-01-01'])
+        #http://localhost/cgi-bin/mmdc.py/collections/TerrestrialConnectivityIndex/coverage?subset=E(260000:528000),N(4488000:4748000),time(%222017-01-01%22)&subset-crs=[EPSG:32631]&crs=[EPSG:32631]&properties=Forest
+        #http://localhost/cgi-bin/mmdc.py/collections/TerrestrialConnectivityIndex/coverage?subset=E(260000:528000),N(4488000:4748000),time(%222017-01-01%22)&subset-crs=[EPSG:32631]&crs=[EPSG:32631]&properties=Forest-Slice(Forest,[%22time%22],[%222012-01-01%22])
 
         allowedFormats=["image/jpeg", "image/png", "image/gif", "image/tiff", "application/x-img"]
         formatToRespond=getFormatToRespond(query_params, allowedFormats)
@@ -816,6 +819,10 @@ def ogcpi(path_param, query_params):
         dc = datacube.Datacube(app='datacube-cgi')
         p=dc.index.products.get_by_name(path_params[1])
         if p:
+            if "storage" in p.definition and "crs" in p.definition["storage"]:
+                crsDef=p.definition["storage"]["crs"]
+            else:
+                crsDef="EPSG:32631"
             subsets=getArgumentsInsensitive(query_params, "subset", [])
             if len(subsets)==0:
                 strBBox=getArgumentInsensitive(query_params, "bbox", "")
@@ -823,10 +830,10 @@ def ogcpi(path_param, query_params):
                     sys.stdout.write('Status: 404\r\nContent-type: text/html\r\nAccess-Control-Allow-Origin: *\r\n\r\n<html><body>Subset or bbox parameter not found.</body></html>\r\n')
                     sys.exit(0)
                 getBBoxFromBBox(strBBox)
-                bboxCrs=getEPSGOldFormat(getArgumentInsensitive(query_params, "bbox-crs", "EPSG:32631"))
+                bboxCrs=getEPSGOldFormat(getArgumentInsensitive(query_params, "bbox-crs", crsDef))
             else:
                 bbox=getBBoxFromSubsetAPI(subsets)
-                bboxCrs=getEPSGOldFormat(getArgumentInsensitive(query_params, "subset-crs", "EPSG:32631"))
+                bboxCrs=getEPSGOldFormat(getArgumentInsensitive(query_params, "subset-crs", crsDef))
             if len(bbox)==0:
                 sys.stdout.write('Status: 404\r\nContent-type: text/html\r\nAccess-Control-Allow-Origin: *\r\n\r\n<html><body>subset=E, subset=N or bbox parameter not found.</body></html>\r\n')
                 sys.exit(0)
@@ -840,9 +847,14 @@ def ogcpi(path_param, query_params):
 
             res=getResolutionFromWidthHeight(getArgumentInsensitive(query_params, "width", ""), getArgumentInsensitive(query_params, "height", ""), bbox)
             if res==None:
-                res=getResolutionFromScaleFactor(getArgumentInsensitive(query_params, "scale-factor", ""), 10)
+                if "storage" in p.definition and "resolution" in p.definition["storage"] and "x" in p.definition["storage"]["resolution"]:
+                    res=p.definition["storage"]["resolution"]["x"]
+                else:
+                    res=10
+
+                res=getResolutionFromScaleFactor(getArgumentInsensitive(query_params, "scale-factor", ""), res)
                 
-            crs=getEPSGOldFormat(getArgumentInsensitive(query_params, "crs", "EPSG:32631"))
+            crs=getEPSGOldFormat(getArgumentInsensitive(query_params, "crs", crsDef))
 
             band=getArgumentInsensitive(query_params, "properties", "")
             if band == "":
